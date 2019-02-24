@@ -1,0 +1,261 @@
+#!/bin/bash
+version="0.4"
+notif_header_outputchange="Monitor settings change"
+screen0=LVDS1
+screen1=DP1
+screen2=VGA1
+screen0var=$(echo $screen0 | tr -d '-')
+screen1var=$(echo $screen1 | tr -d '-')
+screen2var=$(echo $screen2 | tr -d '-')
+afterscript='blabla'
+daemon=false;
+
+usage ()
+{
+	echo "Usage: display-visor [-h] [-f] [-a command] [-i] [-l [switch]] [-n] [-e] [-0 [screen]] [-1 [screen]] [-2 [screen]] [-v]
+
+	-h, --help	Print this help.
+	-f, --feh	Run feh bg script.
+                         Executes ~/.fehbg upon completion.
+        -a, --after-script   Executes provided script upon completion
+        -d, --daemon    Daemon mod. Wait for signals
+	-i, --i3	Test for i3wm instance.
+                         For avoiding conflict with multiple environments.
+	-l, --lid	Check laptop lid status.
+                         Ignored/Assumed closed if not given.
+                         It is possible to specify switch. Defaults to 'LID0'
+                         If unsure, look under /proc/acpi/button/lid/...
+	-n, --notif	Issue a notification on each monitor change.
+                         This uses notify-send over dbus. Notification daemon has to be running.
+	-e, --noecho	Don't echo each monitor change.
+	-0, --screen0	Specify new name for screen 0 (default: LVDS1).
+	-1, --screen1	Specify new name for screen 1 (default: HDMI1).
+	-2, --screen2	Specify new name for screen 2 (default: VGA1).
+	-v, --version	Print version info.
+
+ Useful for setting monitor layouts on system login/resume/hotplug
+ when using window managers that do not handle display settings.
+
+ Depends on xorg-xrandr.
+
+This is free software.
+2015, Michael Heyns <https://github.com/beanaroo>"
+}
+
+handle_args ()
+{
+	while [ "$1" != "" ]; do
+		case $1 in
+			-h | --help )		usage
+								exit;;
+			-f | --feh )		fehbg=true;;
+                        -a | --after-script)    afterscript=$2
+						 shift;;
+                        -d | --daemon)          daemon=true;;
+			-i | --i3 )			i3test=true;;
+			-l | --lid )		lidtest=true
+								if [ "${2:0:1}" == - -o -z "$2" ]; then
+									lidswitch=LID0
+								else
+									lidswitch=$2
+									shift
+								fi
+								lidstatus=$(cat /proc/acpi/button/lid/$lidswitch/state 2>/dev/null | awk '{print $NF}');;
+			-n | --notif )      notification=true;;
+			-e | --noecho )     noecho=true;;
+			-0 | --screen0 )    screen0=$2
+								shift;;
+			-1 | --screen1 )    screen1=$2
+								shift;;
+			-2 | --screen2 )    screen2=$2
+								shift;;
+			-v | --version )	echo "display-visor v$version"
+								exit;;
+			* )				    usage
+								exit 1;;
+		esac
+		shift
+	done
+}
+
+## error handling
+handle_err ()
+{
+	# test for running Xorg server
+	if [ -z "$(ps -C Xorg --no-headers)" ]; then
+		user_output "$prefix No Xorg server found. Exiting..."
+		exit 1
+	fi
+
+	# test for running instance of i3
+	if [ "$i3test" == "true" -a -z "$(ps -C i3 --no-headers)" ]; then
+		user_output "$prefix i3wm not running. Exiting..."
+		exit 1
+	fi
+
+	# test for valid laptop lid status
+	if [ "$lidtest" == "true" -a -z "$lidstatus" ]; then
+		user_output "$prefix Laptop lid switch $lidswitch not found. Exiting..."
+		exit 1
+	fi
+}
+
+# user output
+user_output ()
+{
+	if [ "$1" ]; then
+		if [ -z "$noecho" ]; then
+			echo $prefix $1
+		fi
+		if [ "$2" == "1" -a "$notification" ]; then
+			notify-send -u low -a "display-visor" "$3" "$1"
+		fi
+	fi
+}
+
+## declare output devices
+declare_outputs ()
+{
+	devices=$(find /sys/class/drm/*/status)
+	while read l ; do
+		dev=$(echo $(dirname $l) | cut -d\- -f 2-)
+
+		if [ $(expr match  $dev "HDMI") != "0" ]; then
+			dev=HDMI${dev#HDMI-?-}
+		else
+			dev=$(echo $dev | tr -d '-')
+		fi
+
+		if [ "connected" == $(cat $l) ]; then
+			user_output "$dev connected"
+			declare -gA $dev="yes"
+		fi
+	done <<< "$devices"
+}
+
+## configure monitors for closed lid
+config_closed_lid ()
+{
+	if [ "$lidstatus" == "closed" ]; then
+		user_output "Laptop lid is closed."
+	elif [ "${!screen0var}" -a -z "$lidtest" ]; then
+		user_output "Laptop display will be ignored unless -l option is set."
+	fi
+	if [ "${!screen1var}" -a "${!screen2var}" ]; then
+		user_output "SETTING: $screen1 (Primary) - $screen2 (Left)." 1 "$notif_header_outputchange"
+		xrandr --output $screen0 --off \
+			   --output $screen1 --auto --primary \
+			   --output $screen2 --auto --left-of $screen1
+	elif [ "${!screen1var}" -a -z "${!screen2var}" ]; then
+		user_output "SETTING: $screen1 (Primary)." 1 "$notif_header_outputchange"
+		xrandr --output $screen0 --off \
+			   --output $screen1 --auto --primary \
+			   --output $screen2 --off
+	elif [ -z "${!screen1var}" -a "${!screen2var}" ]; then
+		user_output "SETTING: $screen2 (Primary)." 1 "$notif_header_outputchange"
+		xrandr --output $screen0 --off \
+			   --output $screen1 --off \
+			   --output $screen2 --auto --primary
+	else
+		user_output "No external monitors are plugged in." 1 "$notif_header_outputchange"
+		xrandr --output $screen0 --auto --primary \
+			   --output $screen1 --off \
+			   --output $screen2 --off
+	fi
+}
+
+## configure monitors for open lid
+config_open_lid ()
+{
+	user_output "Laptop lid is open."
+	if [ "${!screen1var}" -a "${!screen2var}" ]; then
+		user_output "$screen1 and $screen2 are plugged in."
+		user_output "SETTING: $screen1 (Primary) - $screen2 (Left)." 1 "$notif_header_outputchange"
+		xrandr --output $screen0 --off \
+			   --output $screen1 --auto --primary \
+			   --output $screen2 --auto --left-of $screen1
+	elif [ "${!screen1var}" -a -z "${!screen2var}" ]; then
+		# work mode: one big screen as main, laptop with smaller screen right of it
+		user_output "$screen1 is plugged in, but not $screen2. Work mode."
+		user_output "SETTING: $screen1 (Primary) - $screen0 (Below)." 1 "$notif_header_outputchange"
+		xrandr --output $screen1 --auto --primary \
+			   --output $screen0 --auto --below $screen1 \
+			   --output $screen2 --off
+	elif [ -z "${!screen1var}" -a "${!screen2var}" ]; then
+		# presentation mode: laptop main screen, presentation on external output
+		user_output "$screen2 is plugged in, but not $screen1. Presentation mode."
+		user_output "SETTING: $screen0 (Primary) - $screen2 (Left)." 1 "$notif_header_outputchange"
+		xrandr --output $screen0 --auto --primary \
+			   --output $screen1 --off \
+			   --output $screen2 --auto --left-of $screen0
+	else
+		user_output "No external monitors are plugged in." 1  "$notif_header_outputchange"
+		xrandr --output $screen0 --auto --primary \
+			   --output $screen1 --off \
+			   --output $screen2 --off
+	fi
+}
+
+# main configuration function
+configure_displays ()
+{
+	handle_err
+
+	declare_outputs
+
+	if [ -z "$lidstatus" -o "$lidstatus" == "closed" ]; then
+		config_closed_lid
+	elif [ "$lidstatus" == "open" ]; then
+		config_open_lid
+	fi
+
+	# run .fehbg script if -f argument is given
+	if [ "$fehbg" == "true" ]; then
+		if [ -x $HOME/.fehbg ]; then
+			user_output "Setting background using .fehbg."
+			$($HOME/.fehbg 2>/dev/null)
+		else
+			user_output "Failed to execute ~/.fehbg script. Use 'feh --bg-xxx' to generate one."
+		fi
+	fi
+
+        # run afterscript if provided
+        echo "After script: " $afterscript
+        if [ "$afterscript" != "" ]; 
+            then
+                echo "Running after script..."
+                $afterscript
+        fi
+
+	# FIXME: prevent segfault occurring from simultanious signals -- Issue #5 --
+	sleep 2
+}
+
+#-----------#
+#	Begin	#
+#-----------#
+# set exit signal trap
+trap "echo 'Received interrupt. Exiting...' ; exit" SIGHUP SIGINT SIGQUIT
+
+# log output
+prefix='[ display-visor: ]:'
+#exec 1> >(logger -s -t "display-visor") 2>&1
+
+# handle arguments
+handle_args "$@"
+
+
+# configure displays upon initialization
+configure_displays
+if [ "$daemon" == "true" ];
+    then
+    # set reconfigure trap
+    trap "echo 'Received signal. Reconfiguring displays.' ; configure_displays" RTMIN+5
+
+    # wait for signals
+    while :
+    do
+	sleep 60 &
+	wait
+    done
+fi
